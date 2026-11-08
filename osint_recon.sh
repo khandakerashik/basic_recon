@@ -367,25 +367,44 @@ else
   printf 'Remove all hosts that are not covered by written authorization.\n'
   printf '============================================================\n\n'
 
-  EDITOR_NAME="${EDITOR:-}"
-  if [[ -n "$EDITOR_NAME" ]]; then
-    # EDITOR is expected to be a simple executable name/path.
-    if command -v "$EDITOR_NAME" >/dev/null 2>&1; then
-      "$EDITOR_NAME" authorized/authorized_hosts.txt || warn "Editor exited with a non-zero status."
+  # This script pipes normal output through tee for logging. Full-screen editors
+  # must bypass that pipe and attach directly to the controlling terminal (/dev/tty),
+  # otherwise nano/vi may look frozen or fail to redraw/respond correctly.
+  if [[ -r /dev/tty && -w /dev/tty ]] && command -v nano >/dev/null 2>&1; then
+    printf 'Opening nano for scope review. Controls: Ctrl+O, Enter = save; Ctrl+X = exit.\n'
+    if nano authorized/authorized_hosts.txt </dev/tty >/dev/tty 2>&1; then
+      log "Scope review editor closed."
     else
-      warn "Configured EDITOR '$EDITOR_NAME' was not found; review the file manually."
-      sed -n '1,160p' authorized/authorized_hosts.txt
+      warn "nano exited with a non-zero status; continuing to allow validation and safe skipping."
     fi
-  elif command -v nano >/dev/null 2>&1; then
-    nano authorized/authorized_hosts.txt
-  elif command -v vi >/dev/null 2>&1; then
-    vi authorized/authorized_hosts.txt
+  elif [[ -r /dev/tty && -w /dev/tty ]] && command -v vi >/dev/null 2>&1; then
+    printf 'Opening vi for scope review. Controls: press i to edit; Esc then :wq and Enter = save/exit.\n'
+    if vi authorized/authorized_hosts.txt </dev/tty >/dev/tty 2>&1; then
+      log "Scope review editor closed."
+    else
+      warn "vi exited with a non-zero status; continuing to allow validation and safe skipping."
+    fi
   else
+    warn "No usable interactive nano/vi terminal was found. Edit the file in another terminal, then return here."
+    printf '\nCurrent staged hostnames (first 160 lines):\n'
     sed -n '1,160p' authorized/authorized_hosts.txt
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+      printf '\nEdit with: nano %q\n' "$OUTDIR/authorized/authorized_hosts.txt"
+      read -r -p "Press Enter after saving the reviewed file, or type SKIP to skip active checks: " SCOPE_ACTION </dev/tty
+      if [[ "${SCOPE_ACTION:-}" == "SKIP" ]]; then
+        log "Operator selected SKIP; active HTTP/TLS checks will be skipped."
+        PASSIVE_ONLY=1
+      fi
+    else
+      warn "No controlling terminal available; skipping active HTTP/TLS checks."
+      PASSIVE_ONLY=1
+    fi
   fi
 
   # Validate every staged host is a syntactically valid hostname under one of the supplied roots.
-  if python3 - roots.txt authorized/authorized_hosts.txt <<'PY'
+  if (( PASSIVE_ONLY )); then
+    log "Scope review skipped; passive discovery results are retained and active checks are disabled."
+  elif python3 - roots.txt authorized/authorized_hosts.txt <<'PY'
 import pathlib, re, sys
 roots = [x.strip().lower().rstrip('.') for x in pathlib.Path(sys.argv[1]).read_text().splitlines() if x.strip()]
 path = pathlib.Path(sys.argv[2])
